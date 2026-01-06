@@ -317,9 +317,9 @@ async def post_init(app: Application) -> None:
     BotCommand("remove", "Xóa mã khỏi danh sách theo dõi"),
     BotCommand("name", "Đổi tên gợi nhớ cho mã vận đơn"),
     BotCommand("list", "Danh sách đơn hàng"),
-    BotCommand("track", "Xem thông tin mới nhất"),
+    BotCommand("tt", "Xem thông tin mới nhất"),
     BotCommand("timeline", "Xem timeline"),
-    BotCommand("interval", "Đổi chu kỳ theo dõi (phút)"),
+    BotCommand("track", "Đổi chu kỳ theo dõi (phút)"),
     BotCommand("help", "Hướng dẫn"),
 ])
 
