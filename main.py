@@ -27,6 +27,22 @@ from telegram.ext import (
     PicklePersistence,
     filters,
 )
+from flask import Flask
+import threading, os
+
+flask_app = Flask(__name__)
+
+@flask_app.get("/")
+def home():
+    return "Bot đang chạy!"
+
+@flask_app.get("/health")
+def health():
+    return {"ok": True}
+
+def run_flask():
+    port = int(os.environ.get("PORT", "10000"))
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 # =========================
 # Config
@@ -613,7 +629,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    print("Bot is running...")
+    threading.Thread(target=run_flask, daemon=True).start()
     app.run_polling()
 
 if __name__ == "__main__":
