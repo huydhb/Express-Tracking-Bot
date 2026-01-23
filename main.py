@@ -112,6 +112,30 @@ def translate_milestone(milestone_code: Optional[int], milestone_name: str) -> s
     return milestone_name or "Không rõ trạng thái"
 
 
+def get_milestone_code(record: dict) -> Optional[int]:
+    raw = record.get("milestone_code")
+    try:
+        return int(raw) if raw is not None else None
+    except Exception:
+        return None
+
+def is_delivered_record(record: dict) -> bool:
+    """
+    Delivered = milestone_code == 8 hoặc milestone_name có chứa "delivered"/"đã giao".
+    """
+    code = get_milestone_code(record)
+    if code == 8:
+        return True
+
+    name = (get_nested(record, "milestone_name") or "").lower()
+    if "delivered" in name or "đã giao" in name:
+        return True
+
+    # fallback: dựa trên bản dịch
+    vi = translate_milestone(code, get_nested(record, "milestone_name"))
+    return "giao thành công" in (vi or "").lower()
+
+
 # =========================
 # Helpers
 # =========================
@@ -193,11 +217,7 @@ def build_template(tracking_id: str, alias: str, record: dict) -> str:
     t = fmt_time_vn(ts) if ts else "Chưa có thời gian"
 
     ms_name = get_nested(record, "milestone_name")
-    ms_code_raw = record.get("milestone_code")
-    try:
-        ms_code = int(ms_code_raw) if ms_code_raw is not None else None
-    except Exception:
-        ms_code = None
+    ms_code = get_milestone_code(record)
 
     status_vi = translate_milestone(ms_code, ms_name)
     st_icon = status_icon(ms_code, ms_name)
@@ -310,6 +330,34 @@ def ensure_watch_job(app: Application, chat_id: int, chat_data: dict) -> None:
         chat_id=chat_id,
     )
 
+def stop_watch_job_if_empty(app: Application, chat_id: int, shipments: Dict[str, dict]) -> None:
+    """Nếu list rỗng thì dừng job theo dõi của chat."""
+    if shipments:
+        return
+    name = f"watch:{chat_id}"
+    for j in app.job_queue.get_jobs_by_name(name):
+        j.schedule_removal()
+
+def render_shipments_list(shipments: Dict[str, dict]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Render list + nút refresh nhanh (tối đa 12 mã)."""
+    if not shipments:
+        return "Danh sách đơn hàng đang trống. Dùng /add để thêm.", None
+
+    lines = ["<b>Danh sách đơn hàng:</b>"]
+    for tid, meta in shipments.items():
+        alias = (meta.get("alias") or "").strip()
+        lines.append(f"<code>{esc(tid)}</code> ({esc(alias)})")
+
+    buttons = []
+    for tid in list(shipments.keys())[:12]:
+        buttons.append([InlineKeyboardButton(f"📦 {tid}", callback_data=f"refresh|{tid}")])
+
+    return (
+        "\n".join(lines),
+        InlineKeyboardMarkup(buttons) if buttons else None,
+    )
+
+
 # =========================
 # Bot commands / handlers
 # =========================
@@ -381,26 +429,13 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shipments = get_shipments(context.chat_data)
-    if not shipments:
-        await update.message.reply_text("Danh sách đơn hàng đang trống. Dùng /add để thêm.")
-        return
-
-    lines = ["<b>Danh sách đơn hàng:</b>"]
-    # show copyable code
-    for tid, meta in shipments.items():
-        alias = (meta.get("alias") or "").strip()
-        lines.append(f"<code>{esc(tid)}</code> ({esc(alias)})")
-
-    # thêm nút bấm nhanh: mỗi mã 1 nút Track
-    buttons = []
-    for tid in list(shipments.keys())[:12]:
-        buttons.append([InlineKeyboardButton(f"📦 {tid}", callback_data=f"refresh|{tid}")])
-
+    text, markup = render_shipments_list(shipments)
     await update.message.reply_text(
-        "\n".join(lines),
+        text,
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        reply_markup=markup,
     )
+
 
 async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -473,13 +508,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
-    # Nếu danh sách rỗng -> stop watch job
-    if not shipments:
-        name = f"watch:{update.effective_chat.id}"
-        jq = context.application.job_queue
-        if jq is not None:
-            for j in jq.get_jobs_by_name(name):
-                j.schedule_removal()
+    stop_watch_job_if_empty(context.application, update.effective_chat.id, shipments)
 
 async def cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) < 2:
@@ -503,16 +532,41 @@ async def cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_latest(update: Update, context: ContextTypes.DEFAULT_TYPE, tracking_id: str):
     shipments = get_shipments(context.chat_data)
-    alias = (shipments.get(tracking_id, {}) or {}).get("alias", "")
+    in_list = tracking_id in shipments
+    alias = (shipments.get(tracking_id, {}) or {}).get("alias", "") if in_list else ""
 
     try:
         payload = await fetch_tracking(tracking_id)
         _, records = parse_payload(payload)
         latest = pick_latest_record(records)
+
+        delivered = is_delivered_record(latest)
+
         msg = build_template(tracking_id, alias, latest)
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=kb_for(tracking_id))
+        await update.message.reply_text(
+            msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_for(tracking_id),
+        )
+
+        # ✅ Nếu đã giao thành công và mã đang được theo dõi -> tự xoá + gửi lại danh sách
+        if in_list and delivered:
+            alias_show = (shipments.get(tracking_id, {}).get("alias") or "").strip()
+            del shipments[tracking_id]
+
+            await update.message.reply_text(
+                f"🧹 Đã tự động xoá khỏi danh sách theo dõi: <code>{esc(tracking_id)}</code> ({esc(alias_show)})",
+                parse_mode=ParseMode.HTML,
+            )
+
+            text_list, markup = render_shipments_list(shipments)
+            await update.message.reply_text(text_list, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+            stop_watch_job_if_empty(context.application, update.effective_chat.id, shipments)
+
     except Exception as e:
         await update.message.reply_text(f"❌ Lỗi tra cứu: {e}")
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -542,24 +596,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     shipments = get_shipments(context.chat_data)
+    in_list = tracking_id in shipments
     alias = (shipments.get(tracking_id, {}) or {}).get("alias", "")
 
     try:
         payload = await fetch_tracking(tracking_id)
         _, records = parse_payload(payload)
 
+        delivered = False
+        reply_markup = kb_for(tracking_id)
+
         if action == "refresh":
             latest = pick_latest_record(records)
+            delivered = is_delivered_record(latest)
             msg = build_template(tracking_id, alias, latest)
+
+            # Nếu đã giao và mã đang được theo dõi -> xoá nút (vì sẽ auto remove)
+            if delivered and in_list:
+                reply_markup = None
+
         elif action == "timeline":
             msg = build_timeline(tracking_id, records, n=8)
         else:
             return
 
-        # edit message (giữ nút bấm)
-        await q.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=kb_for(tracking_id))
+        await q.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+        # ✅ Nếu đã giao thành công và mã đang được theo dõi -> tự xoá + gửi lại danh sách
+        if action == "refresh" and delivered and in_list:
+            alias_show = (shipments.get(tracking_id, {}).get("alias") or "").strip()
+            del shipments[tracking_id]
+
+            chat_id = q.message.chat_id
+            await context.application.bot.send_message(
+                chat_id=chat_id,
+                text=f"🧹 Đã tự động xoá khỏi danh sách theo dõi: <code>{esc(tracking_id)}</code> ({esc(alias_show)})",
+                parse_mode=ParseMode.HTML,
+            )
+
+            text_list, markup = render_shipments_list(shipments)
+            await context.application.bot.send_message(
+                chat_id=chat_id,
+                text=text_list,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+
+            stop_watch_job_if_empty(context.application, chat_id, shipments)
+
     except Exception as e:
         await q.edit_message_text(f"❌ Lỗi: {e}")
+
 
 # =========================
 # Watch job (polling notify)
@@ -568,13 +655,12 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Chạy theo chu kỳ: poll tất cả mã trong context.chat_data["shipments"].
     Nếu latest.actual_time mới hơn last_ts => notify.
+    Nếu đã giao thành công (milestone_code=8) => tự xoá khỏi list và gửi lại danh sách.
     """
     app = context.application
     chat_id = context.job.chat_id
 
-    # ✅ ĐÚNG: dùng context.chat_data (đã có vì job tạo với chat_id)
-    chat_data = context.chat_data
-    shipments = chat_data.get("shipments", {})
+    shipments = get_shipments(context.chat_data)
     if not shipments:
         return
 
@@ -588,19 +674,45 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
             latest = pick_latest_record(records)
             latest_ts = int(latest.get("actual_time") or 0)
 
-            if latest_ts > last_ts:
-                # ✅ chỉ mutate dict con, KHÔNG gán app.chat_data[chat_id] = ...
-                shipments[tracking_id]["last_ts"] = latest_ts
+            if latest_ts <= last_ts:
+                continue
 
-                msg = "📣 <b>Có cập nhật mới</b>\n" + build_template(tracking_id, alias, latest)
+            shipments[tracking_id]["last_ts"] = latest_ts
+
+            delivered = is_delivered_record(latest)
+            header = "✅ <b>Đã giao thành công</b>\n" if delivered else "📣 <b>Có cập nhật mới</b>\n"
+            msg = header + build_template(tracking_id, alias, latest)
+
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None if delivered else kb_for(tracking_id),
+            )
+
+            if delivered and tracking_id in shipments:
+                del shipments[tracking_id]
+
                 await app.bot.send_message(
                     chat_id=chat_id,
-                    text=msg,
+                    text=f"🧹 Đã tự động xoá khỏi danh sách theo dõi: <code>{esc(tracking_id)}</code> ({esc(alias)})",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=kb_for(tracking_id),
                 )
+
+                text_list, markup = render_shipments_list(shipments)
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=text_list,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                )
+
+                if not shipments:
+                    context.job.schedule_removal()
+
         except Exception:
             continue
+
 
 
 # =========================
